@@ -566,6 +566,7 @@ def genotypeGVCFs(infiles, outfile):
     '''Joint genotyping of all samples together'''
     genome = PARAMS["genome_dir"] + "/" + PARAMS["gatkgenome"] + ".fa"
     inputfiles = " --variant ".join(infiles)
+    # options is not used by genotypeGVCFs
     options = PARAMS["gatk_genotype_options"]
     PipelineExome.genotypeGVCFs(inputfiles, outfile, genome, options)
 

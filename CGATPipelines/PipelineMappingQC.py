@@ -65,7 +65,7 @@ def buildPicardInsertSizeStats(infile, outfile, genome_file):
     P.run(statement)
 
 
-def buildPicardAlignmentStats(infile, outfile, genome_file):
+def buildPicardAlignmentStats(infile, outfile, genome_file, cluster_options):
     '''run picard:CollectMultipleMetrics
 
     Arguments
@@ -104,7 +104,7 @@ def buildPicardAlignmentStats(infile, outfile, genome_file):
     VALIDATION_STRINGENCY=SILENT
     >& %(outfile)s'''
 
-    P.run(statement)
+    P.run(statement, **cluster_options)
 
 
 def buildPicardDuplicationStats(infile, outfile):

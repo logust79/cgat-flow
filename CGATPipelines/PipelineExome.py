@@ -26,7 +26,7 @@ from rpy2.robjects import r as R
 import copy
 
 # Set PARAMS in calling module
-PARAMS = {}
+#PARAMS = {}
 
 
 def getGATKOptions():
@@ -44,13 +44,16 @@ def makeSoup(address):
 
 def GATKReadGroups(infile, outfile, genome,
                    library="unknown", platform="Illumina",
-                   platform_unit="1", track="unknown"):
+                   platform_unit="1", track="unknown",
+                   tmp_dir='.',cluster_options = None):
     '''Reorders BAM according to reference fasta and adds read groups'''
 
     if track == 'unknown':
         track = P.snip(os.path.basename(infile), ".bam")
-    tmpdir_gatk = P.get_temp_dir('.')
-    job_options = getGATKOptions()
+    tmpdir_gatk = P.get_temp_dir(tmp_dir)
+    if cluster_options is None:
+        cluster_options = {}
+    #job_options = getGATKOptions()
     job_threads = 3
 
     statement = '''picard ReorderSam
@@ -66,7 +69,7 @@ def GATKReadGroups(infile, outfile, genome,
     statement += '''picard AddOrReplaceReadGroups
                     INPUT=%(tmpdir_gatk)s/%(track)s.reordered.bam
                     OUTPUT=%(outfile)s
-                    RGLB=%(library)s
+                    RGLB=%(track)s
                     RGPL=%(platform)s
                     RGPU=%(platform_unit)s
                     RGSM=%(track)s
@@ -76,13 +79,14 @@ def GATKReadGroups(infile, outfile, genome,
                  ''' % locals()
     statement += '''rm -rf %(tmpdir_gatk)s ;''' % locals()
 
-    P.run(statement)
+    P.run(statement, **cluster_options)
 
 ##############################################################################
 
 
 def GATKIndelRealign(infile, outfile, genome, intervals, padding, threads=4):
     '''Realigns BAMs around indels using GATK'''
+    # Note that this is no longer recommanded if use HaplotypeCaller or MuTect2
 
     intervalfile = outfile.replace(".bam", ".intervals")
     job_options = getGATKOptions()
@@ -108,74 +112,179 @@ def GATKIndelRealign(infile, outfile, genome, intervals, padding, threads=4):
 ##############################################################################
 
 
-def GATKBaseRecal(infile, outfile, genome, intervals, padding, dbsnp,
-                  solid_options=""):
+def GATKBaseRecal(infile, outfile, genome,
+                intervals, padding, dbsnp, solid_options="",
+                gatk_version=3, gatk=None, gatk_options='-Xmx4g',
+                cluster_options=None):
     '''Recalibrates base quality scores using GATK'''
 
     track = P.snip(os.path.basename(infile), ".bam")
     tmpdir_gatk = P.get_temp_dir('.')
     job_options = getGATKOptions()
     job_threads = 3
+    if cluster_options is None:
+        cluster_options = {}
 
-    statement = '''GenomeAnalysisTK
-                    -T BaseRecalibrator
-                    --out %(tmpdir_gatk)s/%(track)s.recal.grp
-                    -R %(genome)s
-                    -L %(intervals)s
-                    -ip %(padding)s
-                    -I %(infile)s
-                    --knownSites %(dbsnp)s %(solid_options)s ;
-                    ''' % locals()
+    if gatk_version == 3:
+        statement = '''GenomeAnalysisTK
+                        -T BaseRecalibrator
+                        --out %(tmpdir_gatk)s/%(track)s.recal.grp
+                        -R %(genome)s
+                        -L %(intervals)s
+                        -ip %(padding)s
+                        -I %(infile)s
+                        --knownSites %(dbsnp)s %(solid_options)s ;
+                        ''' % locals()
 
-    statement += '''GenomeAnalysisTK
-                    -T PrintReads -o %(outfile)s
-                    -BQSR %(tmpdir_gatk)s/%(track)s.recal.grp
-                    -R %(genome)s
-                    -I %(infile)s ;
-                    ''' % locals()
+        statement += '''GenomeAnalysisTK
+                        -T PrintReads -o %(outfile)s
+                        -BQSR %(tmpdir_gatk)s/%(track)s.recal.grp
+                        -R %(genome)s
+                        -I %(infile)s ;
+                        ''' % locals()
 
-    statement += '''rm -rf %(tmpdir_gatk)s ;''' % locals()
-    P.run(statement)
+        statement += '''rm -rf %(tmpdir_gatk)s ;''' % locals()
+    elif gatk_version == 4:
+        if gatk is None:
+            errormsg = 'Currently you need to specify where to find GATK4'
+            raise ValueError(errormsg)
+        statement = '''{gatk} 
+                        BaseRecalibrator
+                        -I {infile}
+                        -R {genome}
+                        --known-sites {dbsnp} {solid_options}
+                        -O {tmpdir_gatk}/{track}.recal.table ;
+                        '''.format(**locals())
+        statement += '''{gatk} 
+                        ApplyBQSR
+                        -R {genome}
+                        -I {infile}
+                        -bqsr {tmpdir_gatk}/{track}.recal.table
+                        -O {outfile}
+                        '''.format(**locals())
+    else:
+        errormsg = 'GATK version has to be either 3 or 4'
+        raise ValueError(errormsg)
+    P.run(statement, **cluster_options)
 
 ##############################################################################
 
 
 def haplotypeCaller(infile, outfile, genome,
-                    dbsnp, intervals, padding, options):
+                    dbsnp, intervals, padding, options,
+                    gatk_version=3, gatk=None, gatk_options='-Xmx4g',
+                    cluster_options=None, wgs=False):
     '''Call SNVs and indels using GATK HaplotypeCaller in all members of a
     family together'''
     job_options = getGATKOptions()
     job_threads = 3
+    if cluster_options is None:
+        cluster_options = {}
 
-    statement = '''GenomeAnalysisTK
-                    -T HaplotypeCaller
-                    -ERC GVCF
-                    -variant_index_type LINEAR
-                    -variant_index_parameter 128000
-                    -o %(outfile)s
-                    -R %(genome)s
-                    -I %(infile)s
-                    --dbsnp %(dbsnp)s
-                    -L %(intervals)s
-                    -ip %(padding)s
-                    %(options)s''' % locals()
-    P.run(statement)
+    if gatk_version == 3:
+        # no wgs here. not interested anyway
+        statement = '''GenomeAnalysisTK
+                        -T HaplotypeCaller
+                        -ERC GVCF
+                        -variant_index_type LINEAR
+                        -variant_index_parameter 128000
+                        -o %(outfile)s
+                        -R %(genome)s
+                        -I %(infile)s
+                        --dbsnp %(dbsnp)s
+                        -L %(intervals)s
+                        -ip %(padding)s
+                        %(options)s''' % locals()
+    elif gatk_version == 4:
+        statement = '''{gatk} --java-options {gatk_options}
+                        HaplotypeCaller
+                        -R {genome}
+                        -I {infile}
+                        -O {outfile}
+                        -ERC GVCF
+                        -L {intervals}
+                        --dbsnp {dbsnp}'''.format(**locals())
+        if wgs:
+            statement += '''
+                        --pcr-indel-model NONE
+                        '''.format(**locals()) 
+        else:
+            statement += '''
+                        -ip {paddings}
+                        '''.format(**locals())
+    P.run(statement, **cluster_options)
 
 
 ##############################################################################
 
 
-def genotypeGVCFs(inputfiles, outfile, genome, options):
-    '''Joint genotyping of all samples together'''
-    job_options = getGATKOptions()
-    job_threads = 3
+def GenomicsDBImport(infiles, outfolder, chrom, gatk,
+                    gatk_options='-Xmx4g', cluster_options=None):
+    '''Move all GVCF files to GenomicsDB, one chromosome at a time'''
+    # !!!Only work with GATK4!!!
+    if cluster_options is None:
+        cluster_options = {}
+    statement = '{gatk} --java-options {gatk_options} GenomicsDBImport '.format(**locals())
+    for infile in infiles:
+        statement += '-V {} '.format(infile)
+    statement += '''--genomicsdb-workspace-path {outfolder}
+                    -L {chrom}
+                    '''.format(**locals())
+    P.run(statement, **cluster_options)                    
 
-    statement = '''GenomeAnalysisTK
-                    -T GenotypeGVCFs
-                    -o %(outfile)s
-                    -R %(genome)s
-                    --variant %(inputfiles)s''' % locals()
-    P.run(statement)
+
+##############################################################################
+
+
+def CombineGVCFs(inputfiles, outfile, genome, gatk, gatk_options='-Xmx4g'):
+    '''Combine gvcfs for genotypeGVCFs (gatk4 only)'''
+    # not tested!
+    statement = '''{gatk} --java-options {gatk_options}
+                CombineGVCFs
+                -R {genome}
+                -O {outfile}
+                '''.format(**locals())
+    for infile in inputfiles:
+        statement += '-V {} '.format(infile)
+
+    p.run(statement)
+
+
+
+##############################################################################
+
+
+def genotypeGVCFs(inputfiles, outfile, genome, gatk,
+                gatk_version=3, gatk_options='-Xmx4g', From='',
+                cluster_options = None):
+    '''Joint genotyping of all samples together'''
+    # Can get it from GVCFs or GenomicsDB
+    # GenomicsDB only applies to gatk4
+    # From has to be ('', 'gendb://')
+    # If use gatk4 and From == '' (which is gvcf),
+    #  the input has to be from CombineGVCFs
+    # From = '' not tested for gatk4
+    if cluster_options is None:
+        cluster_options = {}
+
+    job_options = getGATKOptions()
+    job_threads = 4
+
+    if gatk_version == 3:
+        statement = '''GenomeAnalysisTK
+                        -T GenotypeGVCFs
+                        -o %(outfile)s
+                        -R %(genome)s
+                        --variant %(inputfiles)s''' % locals()
+    elif gatk_version == 4:
+        statement = '''{gatk} --java-options {gatk_options} 
+                    GenotypeGVCFs
+                    -V {From}{inputfiles}
+                    -R {genome}
+                    -O {outfile}
+                    '''.format(**locals())
+    P.run(statement, job_threads=job_threads, **cluster_options)
+
 
 ##############################################################################
 
@@ -275,13 +384,18 @@ def variantAnnotator(vcffile, bamlist, outfile, genome,
 
 
 def variantRecalibrator(infile, outfile, genome, mode, dbsnp=None,
-                        kgenomes=None, hapmap=None, omni=None, mills=None):
+                        kgenomes=None, hapmap=None, omni=None, mills=None,
+                        gatk_version=3, gatk=None, gatk_options='-Xmx4g',
+                        wgs=False, cluster_options=None):
     '''Create variant recalibration file'''
+    # If wgs == True, include DP as a train feature
     job_options = getGATKOptions()
     job_threads = 3
+    if cluster_options is None:
+        cluster_options = {}
 
     track = P.snip(outfile, ".recal")
-    if mode == 'SNP':
+    if mode == 'SNP' and gatk_version == 3:
         statement = '''GenomeAnalysisTK -T VariantRecalibrator
         -R %(genome)s
         -input %(infile)s
@@ -296,8 +410,7 @@ def variantRecalibrator(infile, outfile, genome, mode, dbsnp=None,
         -recalFile %(outfile)s
         -tranchesFile %(track)s.tranches
         -rscriptFile %(track)s.plots.R ''' % locals()
-        P.run(statement)
-    elif mode == 'INDEL':
+    elif mode == 'INDEL' and gatk_version == 3:
         statement = '''GenomeAnalysisTK -T VariantRecalibrator
         -R %(genome)s
         -input %(infile)s
@@ -310,25 +423,86 @@ def variantRecalibrator(infile, outfile, genome, mode, dbsnp=None,
         -recalFile %(outfile)s
         -tranchesFile %(track)s.tranches
         -rscriptFile %(track)s.plots.R ''' % locals()
-        P.run(statement)
+    elif mode == 'SNP' and gatk_version == 4:
+        statement = '''{gatk} --java-options {gatk_options}
+            VariantRecalibrator
+            -R {genome}
+            -V {infile}
+            --resource hapmap,known=false,training=true,truth=true,prior=15.0:{hapmap}
+            --resource omni,known=false,training=true,truth=true,prior=12.0:{omni}
+            --resource 1000G,known=false,training=true,truth=false,prior=10.0:{kgenomes}
+            --resource dbsnp,known=true,training=false,truth=false,prior=2.0:{dbsnp}
+            -an QD 
+            -an FS 
+            -an SOR 
+            -an MQ
+            -an MQRankSum 
+            -an ReadPosRankSum 
+            -mode SNP
+            --max-gaussians 4
+            -tranche 100.0 -tranche 99.9 -tranche 99.0 -tranche 90.0
+            -O {outfile}
+            --tranches-file {track}.tranches
+            --rscript-file {track}.plots.R
+            '''.format(**locals())
+    elif mode == 'INDEL' and gatk_version == 4:
+        statement = '''{gatk} --java-options {gatk_options}
+            VariantRecalibrator
+            -R {genome}
+            -V {infile}
+            --resource mills,known=true,training=true,truth=true,prior=12.0:{mills}
+            -an QD
+            -an FS
+            -an SOR
+            -an MQ
+            -an MQRankSum
+            -an ReadPosRankSum
+            --max-gaussians 4
+            -mode INDEL
+            -tranche 100.0 -tranche 99.9 -tranche 99.0 -tranche 90.0
+            -O {outfile}
+            --tranches-file {track}.tranches
+            --rscript-file {track}.plots.R
+            '''.format(**locals())
+                
+    if wgs:
+        statement += ' -an DP '
+    P.run(statement, **cluster_options)
 
 ##############################################################################
 
 
-def applyVariantRecalibration(vcf, recal, tranches, outfile, genome, mode):
+def applyVariantRecalibration(vcf, recal, tranches, outfile, genome, mode,
+                            gatk_version=3, gatk=None, gatk_options='-Xmx4g',
+                            cluster_options=None):
     '''Perform variant quality score recalibration using GATK '''
     job_options = getGATKOptions()
     job_threads = 3
+    if cluster_options is None:
+        cluster_options = {}
 
-    statement = '''GenomeAnalysisTK -T ApplyRecalibration
-    -R %(genome)s
-    -input:VCF %(vcf)s
-    -recalFile %(recal)s
-    -tranchesFile %(tranches)s
-    --ts_filter_level 99.0
-    -mode %(mode)s
-    -o %(outfile)s ''' % locals()
-    P.run(statement)
+    if gatk_version == 3:
+        statement = '''GenomeAnalysisTK -T ApplyRecalibration
+        -R %(genome)s
+        -input:VCF %(vcf)s
+        -recalFile %(recal)s
+        -tranchesFile %(tranches)s
+        --ts_filter_level 99.0
+        -mode %(mode)s
+        -o %(outfile)s ''' % locals()
+    elif gatk_version == 4:
+        statement = '''{gatk} --java-options {gatk_options}
+                    ApplyVQSR
+                    -R {genome}
+                    -V {vcf}
+                    -ts-filter-level 99.0
+                    -mode {mode}
+                    -O {outfile}
+                    --tranches-file {tranches}
+                    --recal-file {recal}
+                    '''.format(**locals())
+                    
+    P.run(statement, **cluster_options)
 
 ##############################################################################
 
@@ -1277,3 +1451,223 @@ def CleanVariantTables(genes, variants, cols, outfile):
     df.columns = ['gene', 'CHROM', 'POS']
     variants = vp1.merge(df, 'left')
     variants.to_csv(outfile, sep="\t")
+
+###############################################################################
+
+# population freq and cadd annotation
+from CGAT import gnomad_utils, bravo_utils, kaviar_utils, utils
+
+def pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS):
+    # annotate
+    # gnomad
+    if 'gnomad_path' in PARAMS['pop_freqs']:
+        gnomads = gnomad_utils.overall_freqs(
+                list(variant_cache.keys()),
+                PARAMS['pop_freqs']['gnomad_path']
+        )
+        for variant in variant_cache:
+            af = gnomads[variant]['gnomad_af']
+            if af is None:
+                af = ''
+            hom_f = gnomads[variant]['gnomad_hom_f']
+            if hom_f is None:
+                hom_f = ''
+            variant_cache[variant]['gnomad_af'] = af
+                     
+            variant_cache[variant]['gnomad_hom_f'] = hom_f
+                    
+    # bravo
+    if 'bravo_vcf' in PARAMS['pop_freqs']:
+        bravos = bravo_utils.bravo(
+                list(variant_cache.keys()),
+                PARAMS['pop_freqs']['bravo_vcf']
+        )
+        for variant in variant_cache:
+            if variant not in bravos:
+                variant_cache[variant]['bravo_af'] = ''
+                variant_cache[variant]['bravo_hom_f'] = ''
+            else:
+                variant_cache[variant]['bravo_af'] = \
+                    bravos[variant]['af']
+                variant_cache[variant]['bravo_hom_f'] = \
+                    bravos[variant]['Hom']*2 / bravos[variant]['an']
+    # kaviar
+    if 'kaviar_vcf' in PARAMS['pop_freqs']:
+        kaviars = kaviar_utils.kaviar(
+                list(variant_cache.keys()),
+                PARAMS['pop_freqs']['kaviar_vcf']
+        )
+        for variant in variant_cache:
+            if variant not in kaviars:
+                variant_cache[variant]['kaviar_af'] = ''
+            else:
+                variant_cache[variant]['kaviar_af'] = \
+                    kaviars[variant]['af']
+
+    for line in line_cache:
+        record = dict(zip(header, line.rstrip().split('\t')))
+        INFO = record['INFO']
+        pop_info = []
+        for alt in record['ALT'].split(','):
+            v_id = '-'.join([
+                record['CHROM'],
+                record['POS'],
+                record['REF'],
+                alt,
+            ])
+            pop_info.append('|'.join(
+                [alt] + [str(variant_cache[v_id][f]) for f in fields]
+            ))
+        pop_info = 'PF=' + ','.join(pop_info)
+        new_INFO = ';'.join([INFO, pop_info])
+        record['INFO'] = new_INFO
+        new_line = '\t'.join([record[h] for h in header]) + '\n'
+        outf.write(new_line)
+
+def construct_pop_info(fields):
+    info_line = (
+            '##INFO=<ID=PF,Number=.,Type=String,Description="'
+            'Population frequency such as gnomAD and Bravo. '
+            'Format: Allele'
+    )
+    # add fields
+    info_line = '|'.join([info_line] + fields)
+    # closing
+    info_line += '">\n'
+    return info_line
+
+def get_cadd_dict(cadd_file):
+    result = {}
+    with IOTools.open_file(cadd_file,'r') as inf:
+        for line in inf:
+            if line.startswith('#'):
+                continue
+            row = line.rstrip().split('\t')
+            v_id = '-'.join(row[:4])
+            result[v_id] = row[-1]
+    return result
+
+def cadd_annotate(line_cache, cadd_dict, header, outf):
+    # annotate
+    
+    for line in line_cache:
+        record = dict(zip(header, line.rstrip().split('\t')))
+        INFO = record['INFO']
+        cadd_info = []
+        for alt in record['ALT'].split(','):
+            if not set(alt).issubset('ATCGatcg'):
+                continue
+            v_id = '-'.join([
+                record['CHROM'],
+                record['POS'],
+                record['REF'],
+                alt,
+            ])
+
+            cleaned_id = utils.clean_variant(v_id)
+            if cleaned_id not in cadd_dict:
+                cleaned_id = utils.clean_variant(v_id, left=False)
+            cadd_info.append(cadd_dict[cleaned_id])
+        cadd_info = 'CADD=' + ','.join(cadd_info)
+        new_INFO = ';'.join([INFO, cadd_info])
+        record['INFO'] = new_INFO
+        new_line = '\t'.join([record[h] for h in header]) + '\n'
+        outf.write(new_line)
+
+@cluster_runnable
+def add_cadd(infile, outfile, cadd_file, PARAMS):
+    '''
+    add cadd given cadd.vcf.gz
+    '''
+    info_line = (
+            '##INFO=<ID=CADD,Number=A,Type=Float,Description="'
+            'CADD phred score">\n'
+    )
+    # no need to use tabix since cadd file is small
+    cadd_dict = get_cadd_dict(cadd_file)
+    line_cache = []
+    variant_cache = {}
+    header = []
+    chrom = os.path.basename(infile).split('.')[1][3:]
+    min_pos,max_pos = None,None
+    with IOTools.open_file(infile, 'r') as inf, \
+            IOTools.open_file(outfile, 'w') as outf:
+        for line in inf:
+            if line.startswith('##'):
+                outf.write(line)
+            elif line.startswith('#'):
+                # add an INFO line
+                outf.write(info_line)
+                outf.write(line)
+                header = line[1:].rstrip().split('\t')
+            else:
+                # write to cache
+                if not set(line.split('\t')[3]).issubset(set('ATCG')):
+                    continue
+                if min_pos is None:
+                    min_pos = int(line.split('\t')[1])
+                line_cache.append(line)
+
+                if len(line_cache) >= PARAMS['pop_freqs']['cache_size']:
+                    # get cadd_dict
+                    max_pos = int(line.split('\t')[1])
+                    # dump cache
+                    cadd_annotate(line_cache, cadd_dict, header, outf)
+                    min_pos = max_pos
+                    # empty caches
+                    line_cache = []
+
+        # finally dump cache
+        if line_cache:
+            max_pos = int(line.split('\t')[1])
+            cadd_annotate(line_cache, cadd_dict, header, outf)
+            line_cache = []
+
+    
+@cluster_runnable
+def add_pop_freqs(infile, outfile, PARAMS):
+    '''
+    add pop freqs, such as gnomad, bravo and kaviar
+    shove everything in INFO=<ID=PF.
+    '''
+    fields = []
+    if 'gnomad_path' in PARAMS['pop_freqs']:
+        fields.extend(['gnomad_af','gnomad_hom_f'])
+    if 'bravo_vcf' in PARAMS['pop_freqs']:
+        fields.extend(['bravo_af','bravo_hom_f'])
+    if 'kaviar_vcf' in PARAMS['pop_freqs']:
+        fields.append('kaviar_af')
+    line_cache = []
+    variant_cache = {}
+    header = []
+    with IOTools.open_file(infile, 'r') as inf, \
+            IOTools.open_file(outfile, 'w') as outf:
+        for line in inf:
+            if line.startswith('##'):
+                outf.write(line)
+            elif line.startswith('#'):
+                # add an INFO line
+                info_line = construct_pop_info(fields)
+                outf.write(info_line)
+                outf.write(line)
+                header = line[1:].rstrip().split('\t')
+            else:
+                # write to cache
+                line_cache.append(line)
+                row = line.split('\t')
+                for alt in row[4].split(','):
+                    v_id = '-'.join([row[0],row[1],row[3],alt])
+                    variant_cache[v_id]={}
+
+                if len(line_cache) >= PARAMS['pop_freqs']['cache_size']:
+                    # dump cache
+                    pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS)
+                    # empty caches
+                    line_cache = []
+                    variant_cache = {}
+
+        # finally dump cache
+        if line_cache:
+            pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS)
+            line_cache = []
+            variant_cache = {}

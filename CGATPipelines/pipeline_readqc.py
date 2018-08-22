@@ -152,10 +152,17 @@ REGEX_TRACK = r"([^/]+).(fastq.1.gz|fastq.gz|sra|csfasta.gz|remote)"
 # Regular expression to extract a track from both processed and unprocessed
 # files
 REGEX_TRACK_BOTH = \
-    r"(processed.dir/)*([^/]+)\.(fastq.1.gz|fastq.gz|sra|csfasta.gz|remote)"
+    r"({}/processed.dir/)*([^/]+)\.(fastq.1.gz|fastq.gz|sra|csfasta.gz|remote)"\
+    .format(PARAMS['exportdir'])
 
 SEQUENCEFILES_REGEX = r"(\S+).(?P<suffix>fastq.1.gz|fastq.gz|sra|csfasta.gz|remote)"
 
+# some cluster options are not passed properly, 
+#  so I wrote this to come around the issue
+CLUSTER_OPTIONS = dict(
+    job_options = '-l h_rt=240:0:0 -l h=!allen-606-19',
+    job_memory = '16G',
+)
 
 def connect():
     '''
@@ -217,7 +224,7 @@ if PARAMS.get("preprocessors", None):
             cat %(tempfile)s %(infiles)s | fastx_collapser > %(outfile)s;
             rm -f %(tempfile)s
             """
-            P.run(statement)
+            P.run(statement, **CLUSTER_OPTIONS)
 
     else:
         @follows(mkdir("fasta.dir"))
@@ -227,11 +234,11 @@ if PARAMS.get("preprocessors", None):
         def aggregateAdaptors(infile, outfile):
             IOTools.touch_file(outfile)
 
-    @follows(mkdir("processed.dir"),
+    @follows(mkdir("{}/processed.dir".format(PARAMS['exportdir'])),
              aggregateAdaptors)
     @subdivide(INPUT_FORMATS,
                regex(SEQUENCEFILES_REGEX),
-               r"processed.dir/trimmed-\1.fastq*.gz")
+               r"{}/processed.dir/trimmed-\1.fastq*.gz".format(PARAMS['exportdir']))
     def processReads(infile, outfiles):
         '''process reads from .fastq and other sequence files.
         '''
@@ -307,20 +314,24 @@ if PARAMS.get("preprocessors", None):
             else:
                 raise NotImplementedError("tool '%s' not implemented" % tool)
 
-        statement = m.build((infile,), "processed.dir/trimmed-", track)
-        P.run(statement)
+        statement = m.build((infile,), "{}/processed.dir/trimmed-".format(PARAMS['exportdir']), track)
+        P.run(
+                statement,
+                job_memory=job_memory,
+                job_threads=job_threads,
+                job_options=CLUSTER_OPTIONS['job_options'])
 
 else:
-    @follows(mkdir("processed.dir"))
+    @follows(mkdir("{}/processed.dir".format(PARAMS['exportdir'])))
     def processReads():
         """dummy task - no processing of reads."""
 
 
 @active_if(PARAMS["general_reconcile"] == 1)
-@follows(mkdir("reconciled.dir"))
+@follows(mkdir("{}/reconciled.dir".format(PARAMS['exportdir'])))
 @transform(processReads, regex(
-    r"processed.dir\/trimmed-(.*)\.fastq\.1\.gz"),
-    r"reconciled.dir/trimmed-\1.fastq.1.gz")
+    r"{}/processed.dir\/trimmed-(.*)\.fastq\.1\.gz".format(PARAMS['exportdir'])),
+    r"{}/reconciled.dir/trimmed-\1.fastq.1.gz".format(PARAMS['exportdir']))
 def reconcileReads(infile, outfile):
     if PARAMS["general_reconcile"] == 1:
         in1 = infile
@@ -333,7 +344,7 @@ def reconcileReads(infile, outfile):
             --output-filename-pattern=%(outfile)s.fastq.%%s.gz
             %(in1)s %(in2)s"""
 
-        P.run(statement)
+        P.run(statement, **CLUSTER_OPTIONS)
 
 
 @follows(reconcileReads)
@@ -351,7 +362,7 @@ def runFastqc(infiles, outfile):
     '''
     # MM: only pass the contaminants file list if requested by user,
     # do not make this the default behaviour
-    if PARAMS['use_custom_contaiminants']:
+    if PARAMS['use_custom_contaminants']:
         m = PipelineMapping.FastQc(nogroup=PARAMS["readqc_no_group"],
                                    outdir=PARAMS["exportdir"] + "/fastqc",
                                    contaminants=PARAMS['contaminants_path'],
@@ -362,11 +373,11 @@ def runFastqc(infiles, outfile):
                                    qual_format=PARAMS['qual_format'])
 
     if PARAMS["general_reconcile"] == 1:
-        infiles = infiles.replace("processed.dir/trimmed",
-                                  "reconciled.dir/trimmed")
+        infiles = infiles.replace("{}/processed.dir/trimmed".format(PARAMS['exportdir']),
+                                  "{}/reconciled.dir/trimmed".format(PARAMS['exportdir']))
 
     statement = m.build((infiles,), outfile)
-    P.run(statement)
+    P.run(statement, **CLUSTER_OPTIONS)
 
 
 @jobs_limit(PARAMS.get("jobs_limit_db", 1), "db")
@@ -411,7 +422,7 @@ def runFastqScreen(infiles, outfile):
 
     m = PipelineMapping.FastqScreen()
     statement = m.build((infiles,), outfile)
-    P.run(statement, job_memory="8G")
+    P.run(statement, job_memory="8G", job_options='-l h_rt=240:0:0')
     shutil.rmtree(tempdir)
     IOTools.touch_file(outfile)
 
@@ -473,10 +484,10 @@ def buildFastQCSummaryBasicStatistics(infiles, outfile):
                                                      exportdir)
 
 
-@follows(mkdir("experiment.dir"), loadFastqc)
+@follows(mkdir("{}/experiment.dir".format(PARAMS['exportdir'])), loadFastqc)
 @collate(runFastqc,
-         regex("(processed.dir/)*(.*)-([^-]*).fastqc"),
-         r"experiment.dir/\2_per_sequence_quality.tsv")
+         regex("({}/processed.dir/)*(.*)-([^-]*).fastqc".format(PARAMS['exportdir'])),
+         r"{}/experiment.dir/\2_per_sequence_quality.tsv".format(PARAMS['exportdir']))
 def buildExperimentLevelReadQuality(infiles, outfile):
     """
     Collate per sequence read qualities for all replicates per experiment.
@@ -500,7 +511,7 @@ def combineExperimentLevelReadQualities(infiles, outfile):
                  "  --regex-filename='.+/(.+)_per_sequence_quality.tsv' "
                  "%(infiles)s"
                  "> %(outfile)s")
-    P.run(statement)
+    P.run(statement, **CLUSTER_OPTIONS)
 
 
 @jobs_limit(PARAMS.get("jobs_limit_db", 1), "db")
@@ -538,7 +549,7 @@ def renderMultiqc(infile):
         "multiqc . -f && "
         "mv multiqc_report.html MultiQC_report.dir/")
 
-    P.run(statement)
+    P.run(statement, **CLUSTER_OPTIONS)
 
 
 @follows(renderMultiqc)
