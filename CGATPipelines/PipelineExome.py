@@ -23,6 +23,7 @@ import itertools
 from bs4 import BeautifulSoup, NavigableString
 from rpy2.robjects import pandas2ri
 from rpy2.robjects import r as R
+import pysam
 import copy
 
 # Set PARAMS in calling module
@@ -228,6 +229,7 @@ def GenomicsDBImport(infiles, outfolder, chrom, gatk,
     for infile in infiles:
         statement += '-V {} '.format(infile)
     statement += '''--genomicsdb-workspace-path {outfolder}
+                    --batch-size 20
                     -L {chrom}
                     '''.format(**locals())
     P.run(statement, **cluster_options)                    
@@ -264,6 +266,10 @@ def genotypeGVCFs(inputfiles, outfile, genome, gatk,
     # If use gatk4 and From == '' (which is gvcf),
     #  the input has to be from CombineGVCFs
     # From = '' not tested for gatk4
+
+    # If use gatk4, use -new-qual with stand-call-conf 30
+    # refer to (https://github.com/broadinstitute/gatk/issues/4614)
+    # apart from the benefit of new algorithm, old one also has an odd memory issue
     if cluster_options is None:
         cluster_options = {}
 
@@ -279,6 +285,8 @@ def genotypeGVCFs(inputfiles, outfile, genome, gatk,
     elif gatk_version == 4:
         statement = '''{gatk} --java-options {gatk_options} 
                     GenotypeGVCFs
+                    -new-qual
+                    -stand-call-conf 30
                     -V {From}{inputfiles}
                     -R {genome}
                     -O {outfile}
@@ -1509,16 +1517,16 @@ def pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS):
         INFO = record['INFO']
         pop_info = []
         for alt in record['ALT'].split(','):
-            v_id = '-'.join([
+            v_id = utils.clean_variant('-'.join([
                 record['CHROM'],
                 record['POS'],
                 record['REF'],
                 alt,
-            ])
+            ]), human_ref_pysam = PARAMS['human_ref_pysam'])
             pop_info.append('|'.join(
                 [alt] + [str(variant_cache[v_id][f]) for f in fields]
             ))
-        pop_info = 'PF=' + ','.join(pop_info)
+        pop_info = 'POPF=' + ','.join(pop_info)
         new_INFO = ';'.join([INFO, pop_info])
         record['INFO'] = new_INFO
         new_line = '\t'.join([record[h] for h in header]) + '\n'
@@ -1526,7 +1534,7 @@ def pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS):
 
 def construct_pop_info(fields):
     info_line = (
-            '##INFO=<ID=PF,Number=.,Type=String,Description="'
+            '##INFO=<ID=POPF,Number=.,Type=String,Description="'
             'Population frequency such as gnomAD and Bravo. '
             'Format: Allele'
     )
@@ -1556,6 +1564,7 @@ def cadd_annotate(line_cache, cadd_dict, header, outf):
         cadd_info = []
         for alt in record['ALT'].split(','):
             if not set(alt).issubset('ATCGatcg'):
+                cadd_info.append('')
                 continue
             v_id = '-'.join([
                 record['CHROM'],
@@ -1628,8 +1637,9 @@ def add_cadd(infile, outfile, cadd_file, PARAMS):
 def add_pop_freqs(infile, outfile, PARAMS):
     '''
     add pop freqs, such as gnomad, bravo and kaviar
-    shove everything in INFO=<ID=PF.
+    shove everything in INFO=<ID=POPF.
     '''
+    PARAMS['human_ref_pysam'] = pysam.FastaFile(PARAMS['human_ref'])
     fields = []
     if 'gnomad_path' in PARAMS['pop_freqs']:
         fields.extend(['gnomad_af','gnomad_hom_f'])
@@ -1656,7 +1666,10 @@ def add_pop_freqs(infile, outfile, PARAMS):
                 line_cache.append(line)
                 row = line.split('\t')
                 for alt in row[4].split(','):
-                    v_id = '-'.join([row[0],row[1],row[3],alt])
+                    v_id = utils.clean_variant(
+                            '-'.join([row[0],row[1],row[3],alt]),
+                            human_ref_pysam = PARAMS['human_ref_pysam']
+                    )
                     variant_cache[v_id]={}
 
                 if len(line_cache) >= PARAMS['pop_freqs']['cache_size']:
@@ -1671,3 +1684,31 @@ def add_pop_freqs(infile, outfile, PARAMS):
             pop_annotate(line_cache, variant_cache, header, fields, outf, PARAMS)
             line_cache = []
             variant_cache = {}
+
+@cluster_runnable
+def remove_star(infile, outfile, PARAMS):
+    '''
+    remove stars from vcf
+    '''
+    human_ref_pysam = pysam.FastaFile(PARAMS['human_ref'])
+    with IOTools.open_file(infile, 'r') as inf, \
+            IOTools.open_file(outfile, 'w') as outf:
+        for line in inf:
+            if line.startswith('#'):
+                outf.write(line)
+                continue
+            row = line.split('\t')
+            if '*' not in row[4]:
+                outf.write(line)
+                continue
+
+            chrom, pos, ID, ref, alts = row[:5]
+            pos = int(pos)
+            missing_base = human_ref_pysam.fetch(chrom,pos-2,pos-1)
+            new_ref = missing_base + ref
+            new_pos = str(pos - 1)
+            new_alts = ','.join([
+                missing_base + alt.replace('*','') for alt in alts.split(',')
+            ])
+            new_line = '\t'.join([chrom, new_pos, ID, new_ref, new_alts] + row[5:])
+            outf.write(new_line)

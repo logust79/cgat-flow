@@ -58,7 +58,7 @@ def mapReads(infiles, outfile):
     track = P.snip(os.path.basename(outfile), ".bam")
     m = PipelineMapping.BWAMEM(remove_unique=PARAMS["bwa_remove_non_unique"])
     statement = m.build((infiles,), outfile)
-    P.run(statement, job_memory="16G", job_options='-l h_rt=240:0:0', job_threads=PARAMS["bwa_threads"])
+    P.run(statement, job_memory="16G", job_options='-l h_rt=240:0:0 -l h=!allen-606-19', job_threads=PARAMS["bwa_threads"])
 
 
 ###############################################################################
@@ -76,7 +76,7 @@ def PicardAlignStats(infile, outfile):
     '''Run Picard CollectMultipleMetrics on each BAM file'''
     genome = PARAMS["bwa_index_dir"] + "/" + PARAMS["genome"]
     cluster_options = copy.copy(CLUSTER_OPTIONS)
-    cluster_options['job_memory']='20G'
+    cluster_options['job_memory']='30G'
     PipelineMappingQC.buildPicardAlignmentStats(
             infile,
             outfile,
@@ -91,7 +91,8 @@ def PicardAlignStats(infile, outfile):
 # GATK
 
 
-@follows(PicardAlignStats, mkdir("{}/gatk".format(PARAMS['output_folder'])))
+#@follows(PicardAlignStats, mkdir("{}/gatk".format(PARAMS['output_folder'])))
+@follows(mapReads, mkdir("{}/gatk".format(PARAMS['output_folder'])))
 @transform(
         mapReads,
         regex(r"{}/bam/(\S+).bam".format(PARAMS['output_folder'])),
@@ -113,10 +114,12 @@ def GATKReadGroups(infile, outfile):
     platform = PARAMS["readgroup"]["platform"]
     platform_unit = PARAMS["readgroup"]["platform_unit"]
     genome = PARAMS["human_ref"]
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    cluster_options['job_memory']='12G'
     PipelineExome.GATKReadGroups(infile, outfile, genome,
                                  library, platform,
                                  platform_unit, track,
-                                 PARAMS['tmpdir'], CLUSTER_OPTIONS)
+                                 PARAMS['tmpdir'], cluster_options)
     IOTools.zap_file(infile)
 
 ###############################################################################
@@ -136,10 +139,12 @@ def GATKBaseRecal(infile, outfile):
     genome = PARAMS["human_ref"]
     intervals = None
     padding = None
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    cluster_options['job_memory']='12G'
     PipelineExome.GATKBaseRecal(infile, outfile, genome, intervals,
                                 padding, dbsnp, solid_options,
                                 gatk_version=4, gatk=PARAMS['gatk']['executable'],
-                                cluster_options = CLUSTER_OPTIONS)
+                                cluster_options = cluster_options)
     IOTools.zap_file(infile)
 
 ###############################################################################
@@ -165,7 +170,7 @@ def buildCoverageStats(infile, outfile):
     R=%(human_ref)s''' % locals()
     P.run(
         statement,
-        job_memory="16G",
+        job_memory="14G",
         job_options='-l h_rt=240:0:0',
         job_threads=3
     )
@@ -209,11 +214,12 @@ def haplotypeCaller(sentinel, outfile, sample, intervals):
     padding = None
     options = PARAMS["gatk_hc_options"]
     cluster_options = copy.copy(CLUSTER_OPTIONS)
-    #cluster_options['job_memory']="12G"
+    cluster_options['job_memory']="12G"
     infile = '{}/gatk/{}.bqsr.bam'.format(PARAMS['output_folder'], sample)
     PipelineExome.haplotypeCaller(infile, outfile, genome, dbsnp,
                                   intervals, padding, options, wgs=True,
                                   gatk_version=4,
+                                  gatk_options='-Xmx4g',
                                   gatk=PARAMS['gatk']['executable'],
                                   cluster_options=cluster_options)
 
@@ -227,8 +233,10 @@ def haplotypeCaller(sentinel, outfile, sample, intervals):
 )
 def gatkDBImport(infiles, outfile, chrom):
     outfolder = '{}/variants/dbi_{}'.format(PARAMS['output_folder'],chrom)
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    cluster_options['job_memory']="16G"
     PipelineExome.GenomicsDBImport(infiles, outfolder, chrom, PARAMS['gatk']['executable'],
-                    cluster_options=CLUSTER_OPTIONS)
+                    cluster_options=cluster_options)
     IOTools.touch_file(outfile)
 
 
@@ -244,15 +252,21 @@ def genotypeGVCFs(infile, outfile, chrom):
     '''genotypeGVCFS'''
     # get dbi folder
     infolder = '{}/variants/dbi_{}'.format(PARAMS['output_folder'], chrom)
+    temp_file = os.path.join(PARAMS['tmpdir'],'{}.vcf.gz'.format(chrom))
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    # 12G is enough, can test less memory
+    cluster_options['job_memory']="12G"
     PipelineExome.genotypeGVCFs(
         infolder,
-        outfile,
+        temp_file,
         PARAMS['human_ref'],
         PARAMS['gatk']['executable'],
         gatk_version=4,
         From = 'gendb://',
-        cluster_options = CLUSTER_OPTIONS,
+        cluster_options = cluster_options,
     )
+    os.rename(temp_file, outfile)
+    os.rename('{}.tbi'.temp_file, '{}.tbi'.outfile)
     # delete DB
     # need implementation
 
@@ -267,6 +281,8 @@ def genotypeGVCFs(infile, outfile, chrom):
 )
 def variantRecalibratorSnps(infile, outfile, outfile2, chrom):
     '''Create variant recalibration file'''
+    # Note that it creates outfile file even if it fails in the middle.
+    # Need to change code!
     # skip MT
     if chrom == 'MT':
         IOTools.touch_file(outfile)
@@ -274,7 +290,7 @@ def variantRecalibratorSnps(infile, outfile, outfile2, chrom):
         return None
 
     cluster_options = copy.copy(CLUSTER_OPTIONS)
-    cluster_options['job_memory'] = '12G'
+    cluster_options['job_memory'] = '16G'
     genome = PARAMS["human_ref"]
     dbsnp = PARAMS["gatk_dbsnp"]
     job_threads = PARAMS["gatk_threads"]
@@ -327,13 +343,15 @@ def applyVariantRecalibrationSnps(infiles, outfile, chrom):
 )
 def variantRecalibratorIndels(infile, outfile, outfile2, chrom):
     '''Create variant recalibration file'''
+    # Note that it creates outfile file even if it fails in the middle.
+    # Need to change code!
     # skip MT
     if chrom == 'MT':
         IOTools.touch_file(outfile)
         IOTools.touch_file(outfile2)
         return None
     cluster_options = copy.copy(CLUSTER_OPTIONS)
-    cluster_options['job_memory'] = '10G'
+    cluster_options['job_memory'] = '16G'
     genome = PARAMS["human_ref"]
     job_threads = PARAMS["gatk_threads"]
     track = P.snip(outfile, ".recal")
@@ -367,6 +385,8 @@ def applyVariantRecalibrationIndels(infiles, outfile, chrom):
     genome = PARAMS["human_ref"]
     mode = 'INDEL'
     gatk = PARAMS['gatk']['executable']
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    cluster_options['job_memory'] = '12G'
     PipelineExome.applyVariantRecalibration(vcf, recal, tranches,
                                             outfile, genome, mode,
                                             gatk=gatk, gatk_version=4,
@@ -374,21 +394,44 @@ def applyVariantRecalibrationIndels(infiles, outfile, chrom):
 
 ###############################################################################
 
-@follows(mkdir('{}/vep'.format(PARAMS['output_folder'])))
 @transform(
     applyVariantRecalibrationIndels,
-    regex(r"(\S+)/variants/(\w+).vqsr.vcf.gz"),
+    regex(r"(\S+)/(\w+).vqsr.vcf.gz"),
+    r"\1/\2.noStar.vcf.gz",
+    r"\2.noStar.vcf"
+)
+def removeStar(infile, outfile, tmpfile):
+    '''
+    VQSR vcf use * to mark deletions, and vep/CADD don't like it.
+    fix it now!
+    '''
+    tmpfile = os.path.join(PARAMS['tmpdir'], tmpfile)
+    PipelineExome.remove_star(infile, tmpfile, PARAMS, submit=True, job_memory="8G", job_options='-l h_rt=240:0:0')
+    statement = '''
+        bgzip -c {tmpfile} > {outfile};
+        tabix -p vcf {outfile};
+        rm {tmpfile}
+    '''.format(**locals())
+    P.run(statement, **CLUSTER_OPTIONS)
+    
+###############################################################################
+
+@follows(mkdir('{}/vep'.format(PARAMS['output_folder'])))
+@transform(
+    removeStar,
+    regex(r"(\S+)/variants/(\w+).noStar.vcf.gz"),
     r"\1/vep/\2.vep.vcf.gz",
     r"\2.vep.vcf"
 )
 def vep(infile, outfile, tmpfile):
     ''' vep '''
     vep_dict = PARAMS['annotation']['vep']
+    vep_dict['fasta'] = PARAMS['human_ref']
     tmpfile = os.path.join(PARAMS['tmpdir'], tmpfile)
     cluster_options = copy.copy(CLUSTER_OPTIONS)
-    cluster_options['job_memory'] = '9G'
+    cluster_options['job_memory'] = '12G'
     statement = '''
-        {executable} -i {infile} {options} --dir {dir}
+        {executable} -i {infile} {options} --dir {dir} --fasta {fasta}
         -a {build} --fork {fork} -o {tmpfile};
         bgzip -c {tmpfile} > {outfile};
         tabix -p vcf {outfile};
@@ -409,7 +452,9 @@ def cadd(infile, outfile):
     cadd = PARAMS['cadd']['executable']
     statement = '''{cadd} {infile} {outfile};
         tabix -p vcf {outfile}'''.format(**locals())
-    P.run(statement, job_memory="10G")
+    cluster_options = copy.copy(CLUSTER_OPTIONS)
+    cluster_options['job_memory'] = '16G'
+    P.run(statement, **cluster_options)
 
 '''population annotation'''
 '''doesn't work on MT'''
@@ -447,7 +492,7 @@ def addPop(infile, outfile, basename, chrom):
     r'\1',
 )
 def addCadd(infile, outfile, basename, chrom):
-    cadd_file = '{}/cadd/{}.cadd.gz'.format(PARAMS['tmpdir'],chrom)
+    cadd_file = '{}/cadd3/{}.cadd.gz'.format(PARAMS['tmpdir'],chrom)
     temp_dir = P.get_temp_dir(PARAMS['tmpdir'])
     temp_outfile = os.path.join(temp_dir, basename)
     PipelineExome.add_cadd(infile, temp_outfile, cadd_file, PARAMS, submit=True, job_memory="10G", job_options='-l h_rt=240:0:0')
